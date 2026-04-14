@@ -108,6 +108,10 @@ class Hyperparameters:
     smear_gate = bool(int(os.environ.get("SMEAR_GATE", "1")))  # 0=disabled
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))          # 0=disabled
     ve_dim = int(os.environ.get("VE_DIM", 128))                 # 0=disabled
+    # Depth recurrence: loop the bottleneck blocks an extra (RECUR_N-1) times.
+    # RECUR_BLOCKS is a comma-separated list of block indices (default: last encoder + first decoder).
+    recur_n = int(os.environ.get("RECUR_N", 2))
+    recur_blocks = os.environ.get("RECUR_BLOCKS", "4,5")  # block indices to recur
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -389,6 +393,9 @@ SMALL_TENSOR_MAX_NUMEL = 65_536
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+# SDClip: std-based clip threshold for int6 quantization (Track 1, #1394 technique).
+# clip = k * row_std; k=2.5 is the default from #1394 which optimises compression entropy.
+_SDCLIP_K: float = float(os.environ.get("SDCLIP_K", "2.5"))
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -446,21 +453,14 @@ def _unpack_int6(packed: Tensor, n: int, shape: tuple) -> Tensor:
     return torch.from_numpy(q.copy()).reshape(shape)
 
 def _quantize_int6_row(t: Tensor) -> tuple[Tensor, Tensor]:
-    # Per-row int6: GPTQ-lite clip search over 5 percentiles (minimise MSE); 1D → absmax.
+    # Per-row int6: SDClip (clip = _SDCLIP_K * row_std); optimises compression entropy
+    # rather than reconstruction MSE. Replaces old GPTQ-lite percentile search. 1D → absmax.
     t32 = t.float()
     if t32.ndim == 2:
-        best_q, best_s, best_err = None, None, float('inf')
-        for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
-            if pct < 1.0:
-                row_clip = torch.quantile(t32.abs(), pct, dim=1)
-            else:
-                row_clip = t32.abs().amax(dim=1)
-            s = (row_clip / 31.0).clamp_min(torch.finfo(torch.float16).tiny).to(torch.float16)
-            q = torch.clamp(torch.round(t32 / s.float()[:, None]), -32, 31).to(torch.int8)
-            err = (t32 - q.float() * s.float()[:, None]).pow(2).mean().item()
-            if err < best_err:
-                best_q, best_s, best_err = q, s, err
-        return best_q, best_s
+        row_clip = (_SDCLIP_K * t32.std(dim=1)).clamp_min(1e-12)
+        s = (row_clip / 31.0).clamp_min(torch.finfo(torch.float16).tiny).to(torch.float16)
+        q = torch.clamp(torch.round(t32 / s.float()[:, None]), -32, 31).to(torch.int8)
+        return q, s
     # 1D fallback: simple absmax (biases, scalars)
     amax = float(t32.abs().max().item())
     scale = torch.tensor(max(amax / 31.0, 1e-12), dtype=torch.float16)
@@ -650,9 +650,9 @@ class CastedLinear(nn.Linear):
             # STE: compute quantized weights in no_grad, then re-attach via straight-through trick.
             with torch.no_grad():
                 w32 = w.float()
-                row_max = w32.abs().amax(dim=1)
-                # Per-row int6 scale, same formula as the post-training quantizer.
-                scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
+                # Match SDClip: scale = (k * row_std) / 31 so QAT simulates the same clip.
+                row_clip = (_SDCLIP_K * w32.std(dim=1)).clamp_min(1.0 / 31.0)
+                scale = (row_clip / 31.0).clamp_min(1.0 / 31.0)
                 w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x.dtype)
             # w_ste has quantized values in forward, but grad of (w_q - w).detach() is 0
             # so the full gradient passes straight through to w as if no rounding occurred.
@@ -916,6 +916,8 @@ class GPT(nn.Module):
         xsa_last_n: int = 0,
         ve_dim: int = 0,
         smear_gate: bool = True,
+        recur_n: int = 1,
+        recur_blocks: str = "",
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -923,6 +925,13 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        # Depth recurrence: run _recur_block_indices blocks extra (_recur_n - 1) times
+        # between the encoder and decoder passes. Adds effective depth at zero parameter cost.
+        self._recur_n = max(1, recur_n)
+        self._recur_block_indices: list[int] = (
+            [int(b.strip()) for b in recur_blocks.split(",") if b.strip()]
+            if recur_blocks else []
+        )
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         # BigramHash: additive to the token embedding when vocab_size > 0.
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
@@ -1014,6 +1023,13 @@ class GPT(nn.Module):
             v_e = ve_base * self.ve_scale[i].to(ve_base.dtype) if ve_base is not None else None
             x = self.blocks[i](x, x0, v_extra=v_e)
             skips.append(x)
+        # Depth recurrence: run bottleneck blocks extra (recur_n - 1) times between
+        # encoder and decoder. Same weights, different inputs each pass — free effective depth.
+        if self._recur_n > 1 and self._recur_block_indices:
+            for _ in range(self._recur_n - 1):
+                for bi in self._recur_block_indices:
+                    v_e = ve_base * self.ve_scale[bi].to(ve_base.dtype) if ve_base is not None else None
+                    x = self.blocks[bi](x, x0, v_extra=v_e)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
@@ -1147,6 +1163,8 @@ def main() -> None:
         xsa_last_n=args.xsa_last_n,
         ve_dim=args.ve_dim,
         smear_gate=args.smear_gate,
+        recur_n=args.recur_n,
+        recur_blocks=args.recur_blocks,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
