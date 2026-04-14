@@ -650,8 +650,9 @@ class CastedLinear(nn.Linear):
             # STE: compute quantized weights in no_grad, then re-attach via straight-through trick.
             with torch.no_grad():
                 w32 = w.float()
-                # Match SDClip: scale = (k * row_std) / 31 so QAT simulates the same clip.
-                row_clip = (_SDCLIP_K * w32.std(dim=1)).clamp_min(1.0 / 31.0)
+                # Match SDClip post-training: row_clip = k*std (same clamp_min as quantizer).
+                # scale.clamp_min(1/31) is a QAT safety floor for gradient stability only.
+                row_clip = (_SDCLIP_K * w32.std(dim=1)).clamp_min(1e-12)
                 scale = (row_clip / 31.0).clamp_min(1.0 / 31.0)
                 w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x.dtype)
             # w_ste has quantized values in forward, but grad of (w_q - w).detach() is 0
@@ -932,6 +933,13 @@ class GPT(nn.Module):
             [int(b.strip()) for b in recur_blocks.split(",") if b.strip()]
             if recur_blocks else []
         )
+        # Validate block indices eagerly — IndexError during forward is harder to debug.
+        for bi in self._recur_block_indices:
+            if bi < 0 or bi >= num_layers:
+                raise ValueError(
+                    f"RECUR_BLOCKS index {bi} is out of range for num_layers={num_layers}. "
+                    f"Valid indices: 0..{num_layers - 1}."
+                )
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         # BigramHash: additive to the token embedding when vocab_size > 0.
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
@@ -1257,6 +1265,18 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(
+        f"arch:layers={args.num_layers} dim={args.model_dim} heads={args.num_heads} "
+        f"mlp_mult={args.mlp_mult} rope_dims={args.rope_dims}"
+    )
+    log0(
+        f"features:xsa_last_n={args.xsa_last_n} ve_dim={args.ve_dim} "
+        f"bigram={args.bigram_vocab_size} smear_gate={int(args.smear_gate)}"
+    )
+    log0(
+        f"track1:sdclip_k={_SDCLIP_K} recur_n={args.recur_n} "
+        f"recur_blocks={args.recur_blocks!r}"
+    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP

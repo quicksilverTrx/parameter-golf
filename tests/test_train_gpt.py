@@ -1675,6 +1675,17 @@ class TestDepthRecurrence:
         model = self._make_recur_model(recur_n=2, recur_blocks="")
         assert model._recur_block_indices == []
 
+    def test_recur_out_of_bounds_raises(self):
+        """recur_blocks with index >= num_layers must raise ValueError at construction time."""
+        import pytest
+        with pytest.raises(ValueError, match="out of range"):
+            tg.GPT(
+                vocab_size=32, num_layers=4, model_dim=64, num_heads=4, num_kv_heads=2,
+                mlp_mult=2, tie_embeddings=True, tied_embed_init_std=0.005,
+                logit_softcap=30.0, rope_base=10000.0, qk_gain_init=1.5,
+                recur_n=2, recur_blocks="4,5",  # index 4,5 out of range for 4-layer model
+            )
+
     @needs_rms_norm
     def test_recur_forward_no_nan(self):
         """forward_logits with depth recurrence (recur_n=2) must not produce NaN."""
