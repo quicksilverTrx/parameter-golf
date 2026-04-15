@@ -1486,7 +1486,7 @@ def main() -> None:
     if args.eval_stride < args.train_seq_len:
         q_val_loss, q_val_bpb = eval_val_sliding(
             args,
-            model,
+            base_model,
             rank,
             world_size,
             device,
@@ -1501,7 +1501,7 @@ def main() -> None:
     else:
         q_val_loss, q_val_bpb = eval_val(
             args,
-            model,
+            base_model,
             rank,
             world_size,
             device,
